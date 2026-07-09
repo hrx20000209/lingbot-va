@@ -1,6 +1,9 @@
 # Copyright 2024-2025 The Robbyant Team Authors. All rights reserved.
 import argparse
+import copy
 import os
+import random
+import shutil
 import sys
 from pathlib import Path
 import wandb
@@ -18,6 +21,7 @@ from torch.distributed.checkpoint.state_dict import (
 )
 from safetensors.torch import save_file, load_file
 import json
+import numpy as np
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
@@ -67,6 +71,8 @@ class Trainer:
         self.device = torch.device(f"cuda:{config.local_rank}")
         self.dtype = config.param_dtype
         self.patch_size = config.patch_size
+        self.video_loss_weight = getattr(config, 'video_loss_weight', 1.0)
+        self.action_loss_weight = getattr(config, 'action_loss_weight', 1.0)
 
         # Load models
         logger.info("Loading models...")
@@ -88,6 +94,8 @@ class Trainer:
             attn_mode="flex"
         )
 
+        self._configure_trainable_parameters()
+
         logger.info("Setting up activation checkpointing ...")
         apply_ac(self.transformer)
 
@@ -101,7 +109,6 @@ class Trainer:
             eval_mode=False,
         )
         self.transformer.train()
-        self.transformer.requires_grad_(True)
 
         # Optimizer
         self.optimizer = torch.optim.AdamW(
@@ -119,7 +126,10 @@ class Trainer:
 
         # Setup dataloaders
         logger.info("Setting up datasets...")
-        train_dataset = MultiLatentLeRobotDataset(config=config)
+        train_dataset = MultiLatentLeRobotDataset(
+            config=config,
+            num_init_worker=getattr(config, "num_init_worker", 4),
+        )
         train_sampler = DistributedSampler(
             train_dataset,
             num_replicas=config.world_size,
@@ -134,6 +144,22 @@ class Trainer:
             num_workers=config.load_worker,
             sampler=train_sampler,
         )
+        self.val_loader = None
+        if getattr(config, 'val_episode_ids', None):
+            val_dataset = MultiLatentLeRobotDataset(config=config, split="val")
+            val_sampler = DistributedSampler(
+                val_dataset,
+                num_replicas=config.world_size,
+                rank=config.rank,
+                shuffle=False,
+            ) if config.world_size > 1 else None
+            self.val_loader = DataLoader(
+                val_dataset,
+                batch_size=config.batch_size,
+                shuffle=False,
+                num_workers=config.load_worker,
+                sampler=val_sampler,
+            )
 
         self.train_scheduler_latent = FlowMatchScheduler(shift=self.config.snr_shift, sigma_min=0.0, extra_one_step=True)
         self.train_scheduler_latent.set_timesteps(1000, training=True)
@@ -142,11 +168,63 @@ class Trainer:
 
         self.save_dir = Path(config.save_root) / "checkpoints"
         self.save_dir.mkdir(parents=True, exist_ok=True)
+        self.metrics_path = Path(config.save_root) / "train_metrics.jsonl"
+        if config.rank == 0:
+            Path(config.save_root).mkdir(parents=True, exist_ok=True)
+            with open(Path(config.save_root) / "training_config.json", "w") as f:
+                json.dump(self._jsonable_config(), f, indent=2)
 
         self.gradient_accumulation_steps = getattr(config, 'gradient_accumulation_steps', 1)
         self.train_loader_iter = None
         # if hasattr(config, 'resume_from') and config.resume_from:
         #     self._load_training_state(config.resume_from)
+
+    def _configure_trainable_parameters(self):
+        mode = getattr(self.config, "train_mode", "full")
+        if mode == "full":
+            self.transformer.requires_grad_(True)
+        elif mode == "action_last_n":
+            self.transformer.requires_grad_(False)
+            for module_name in (
+                "action_embedder",
+                "action_proj_out",
+                "condition_embedder_action",
+            ):
+                getattr(self.transformer, module_name).requires_grad_(True)
+            last_n = int(getattr(self.config, "train_last_n_blocks", 8))
+            if not 0 < last_n <= len(self.transformer.blocks):
+                raise ValueError(f"train_last_n_blocks must be in [1, {len(self.transformer.blocks)}]")
+            for block in self.transformer.blocks[-last_n:]:
+                block.requires_grad_(True)
+        else:
+            raise ValueError(f"Unknown train_mode: {mode}")
+
+        trainable = sum(p.numel() for p in self.transformer.parameters() if p.requires_grad)
+        total = sum(p.numel() for p in self.transformer.parameters())
+        logger.info(
+            f"Train mode {mode}: {trainable:,}/{total:,} parameters "
+            f"({100 * trainable / total:.2f}%) are trainable"
+        )
+
+    def _jsonable_config(self):
+        result = {}
+        for key, value in self.config.items():
+            if isinstance(value, torch.dtype):
+                value = str(value)
+            elif isinstance(value, Path):
+                value = str(value)
+            try:
+                json.dumps(value)
+            except TypeError:
+                value = str(value)
+            result[key] = value
+        return result
+
+    def _write_metrics(self, metrics):
+        if self.config.rank != 0:
+            return
+        with open(self.metrics_path, "a") as f:
+            f.write(json.dumps(metrics) + "\n")
     
     def _get_next_batch(self):
         """Get next batch from iterator, reset if epoch is finished."""
@@ -290,9 +368,13 @@ class Trainer:
         # Sum per frame and normalize by mask per frame
         action_loss_per_frame = action_loss.sum(dim=1)  # (B*F,)
         action_mask_per_frame = action_mask.sum(dim=1)  # (B*F,)
-        action_loss = (action_loss_per_frame / (action_mask_per_frame + 1e-6)).mean()
+        valid_action_frames = action_mask_per_frame > 0
+        action_loss = (
+            action_loss_per_frame[valid_action_frames]
+            / action_mask_per_frame[valid_action_frames]
+        ).mean()
 
-        return latent_loss / self.gradient_accumulation_steps, action_loss / self.gradient_accumulation_steps
+        return latent_loss, action_loss
 
     def _train_step(self, batch, batch_idx):
         """Train a single batch, returns losses for logging."""
@@ -308,7 +390,10 @@ class Trainer:
 
         output = self.transformer(input_dict, train_mode=True)
         latent_loss, action_loss = self.compute_loss(input_dict, output)
-        loss = latent_loss + action_loss
+        loss = (
+            self.video_loss_weight * latent_loss
+            + self.action_loss_weight * action_loss
+        ) / self.gradient_accumulation_steps
 
         loss.backward()
 
@@ -316,7 +401,10 @@ class Trainer:
         
         # Only update weights after accumulating gradients
         if should_sync:
-            total_norm = torch.nn.utils.clip_grad_norm_(self.transformer.parameters(), 2.0)
+            total_norm = torch.nn.utils.clip_grad_norm_(
+                self.transformer.parameters(),
+                getattr(self.config, "max_grad_norm", 2.0),
+            )
             self.optimizer.step()
             self.lr_scheduler.step()
             self.optimizer.zero_grad()
@@ -327,6 +415,40 @@ class Trainer:
             losses['should_log'] = False
 
         return losses
+
+    @torch.no_grad()
+    def validate(self):
+        if self.val_loader is None:
+            return None
+        self.transformer.eval()
+        latent_losses = []
+        action_losses = []
+        max_batches = int(getattr(self.config, "validation_batches", len(self.val_loader)))
+        devices = [self.device.index] if self.device.type == "cuda" else []
+        with torch.random.fork_rng(devices=devices):
+            torch.manual_seed(12345)
+            for batch_index, batch in enumerate(self.val_loader):
+                if batch_index >= max_batches:
+                    break
+                batch = self.convert_input_format(batch)
+                input_dict = self._prepare_input_dict(batch)
+                output = self.transformer(input_dict, train_mode=True)
+                latent_loss, action_loss = self.compute_loss(input_dict, output)
+                latent_losses.append(latent_loss.detach())
+                action_losses.append(action_loss.detach())
+        self.transformer.train()
+        if not latent_losses:
+            return None
+        latent_loss = dist_mean(torch.stack(latent_losses).mean()).cpu().item()
+        action_loss = dist_mean(torch.stack(action_losses).mean()).cpu().item()
+        return {
+            "val/video_loss": latent_loss,
+            "val/action_loss": action_loss,
+            "val/weighted_loss": (
+                self.video_loss_weight * latent_loss
+                + self.action_loss_weight * action_loss
+            ),
+        }
 
     def save_checkpoint(self,):
         """Save model checkpoint in the same format as pretrained model."""
@@ -374,6 +496,14 @@ class Trainer:
                 # }, training_state_path)
 
                 logger.info(f"Checkpoint saved successfully at step {self.step}")
+                last_path = self.save_dir / "last"
+                if last_path.is_symlink() or last_path.exists():
+                    if last_path.is_dir() and not last_path.is_symlink():
+                        shutil.rmtree(last_path)
+                    else:
+                        last_path.unlink()
+                last_path.symlink_to(checkpoint_dir.name, target_is_directory=True)
+                self._prune_checkpoints()
 
             # Synchronize all processes after saving
             if dist.is_initialized():
@@ -387,6 +517,15 @@ class Trainer:
             # Ensure all processes stay synchronized even on error
             if dist.is_initialized():
                 dist.barrier()
+
+    def _prune_checkpoints(self):
+        keep = int(getattr(self.config, "max_checkpoints", 3))
+        checkpoints = sorted(
+            (path for path in self.save_dir.glob("checkpoint_step_*") if path.is_dir()),
+            key=lambda path: int(path.name.rsplit("_", 1)[-1]),
+        )
+        for path in checkpoints[:-keep]:
+            shutil.rmtree(path)
 
     def _load_training_state(self, checkpoint_path):
         """Load training state (optimizer + step) after FSDP and optimizer creation."""
@@ -454,42 +593,54 @@ class Trainer:
                 lr = self.lr_scheduler.get_last_lr()[0]
 
                 # Average accumulated losses
-                latent_loss_show = dist_mean(torch.stack(accumulated_latent_losses).sum()).detach().cpu().item()
-                action_loss_show = dist_mean(torch.stack(accumulated_action_losses).sum()).detach().cpu().item()
-                max_latent_loss_show = dist_max(torch.stack(accumulated_latent_losses).sum()).detach().cpu().item()
-                max_action_loss_show = dist_max(torch.stack(accumulated_action_losses).sum()).detach().cpu().item()
+                latent_loss_show = dist_mean(torch.stack(accumulated_latent_losses).mean()).detach().cpu().item()
+                action_loss_show = dist_mean(torch.stack(accumulated_action_losses).mean()).detach().cpu().item()
+                max_latent_loss_show = dist_max(torch.stack(accumulated_latent_losses).max()).detach().cpu().item()
+                max_action_loss_show = dist_max(torch.stack(accumulated_action_losses).max()).detach().cpu().item()
 
                 # Clear accumulated losses
                 accumulated_latent_losses = []
                 accumulated_action_losses = []
                 step_in_accumulation = 0
 
+                self.step += 1
                 torch.cuda.synchronize()
                 if self.step % self.config.gc_interval == 0:
                     torch.cuda.empty_cache()
                     gc.collect()
 
+                total_norm = losses['total_norm'].detach().cpu().item()
+                metrics = {
+                    "step": self.step,
+                    "train/video_loss": latent_loss_show,
+                    "train/action_loss": action_loss_show,
+                    "train/weighted_loss": (
+                        self.video_loss_weight * latent_loss_show
+                        + self.action_loss_weight * action_loss_show
+                    ),
+                    "train/max_video_loss": max_latent_loss_show,
+                    "train/max_action_loss": max_action_loss_show,
+                    "train/grad_norm": total_norm,
+                    "lr": lr,
+                }
+                validation_interval = int(getattr(self.config, "validation_interval", 0))
+                if validation_interval and self.step % validation_interval == 0:
+                    validation_metrics = self.validate()
+                    if validation_metrics:
+                        metrics.update(validation_metrics)
+
                 if self.config.rank == 0:
-                    total_norm = losses['total_norm']
                     progress_bar.n += 1
                     progress_bar.set_postfix({
                         'latent_loss': f'{latent_loss_show:.4f}',
                         'action_loss': f'{action_loss_show:.4f}',
                         'step': self.step,
-                        'grad_norm': f'{total_norm.item():.2f}',
+                        'grad_norm': f'{total_norm:.2f}',
                         'lr': f'{lr:.2e}'
                     })
+                    self._write_metrics(metrics)
                     if self.config.enable_wandb:
-                        self.wandb.log({
-                            'loss_metrics/global_avg_video_loss': latent_loss_show,
-                            'loss_metrics/global_avg_action_loss': action_loss_show,
-                            'loss_metrics/global_max_video_loss': max_latent_loss_show,
-                            'loss_metrics/global_max_action_loss': max_action_loss_show,
-                            'grad_norm': total_norm.item(),
-                            'lr': lr,
-                        }, step=self.step)
-                
-                self.step += 1
+                        self.wandb.log(metrics, step=self.step)
                 
                 if self.step % self.config.save_interval == 0:
                     if self.config.rank == 0:
@@ -505,12 +656,16 @@ class Trainer:
 
 def run(args):
     """Main entry point."""
-    config = VA_CONFIGS[args.config_name]
+    config = copy.deepcopy(VA_CONFIGS[args.config_name])
 
     rank = int(os.getenv("RANK", 0))
     local_rank = int(os.environ.get('LOCAL_RANK', 0))
     world_size = int(os.environ.get("WORLD_SIZE", 1))
 
+    seed = args.seed + rank
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
     init_distributed(world_size, local_rank, rank)
 
     config.rank = rank
@@ -519,6 +674,24 @@ def run(args):
 
     if args.save_root is not None:
         config.save_root = args.save_root
+    if args.pretrained_model_path is not None:
+        config.wan22_pretrained_model_name_or_path = args.pretrained_model_path
+    override_names = (
+        "num_steps",
+        "save_interval",
+        "validation_interval",
+        "train_mode",
+        "train_last_n_blocks",
+        "learning_rate",
+        "gradient_accumulation_steps",
+        "video_loss_weight",
+        "action_loss_weight",
+        "load_worker",
+    )
+    for name in override_names:
+        value = getattr(args, name)
+        if value is not None:
+            config[name] = value
 
     if rank == 0:
         logger.info(f"Using config: {args.config_name}")
@@ -543,6 +716,23 @@ def main():
         default=None,
         help="Root directory for saving checkpoints",
     )
+    parser.add_argument(
+        "--pretrained-model-path",
+        type=str,
+        default=None,
+        help="Base model root containing transformer/ (useful for ablations and smoke tests)",
+    )
+    parser.add_argument("--num-steps", type=int, default=None)
+    parser.add_argument("--save-interval", type=int, default=None)
+    parser.add_argument("--validation-interval", type=int, default=None)
+    parser.add_argument("--train-mode", choices=["full", "action_last_n"], default=None)
+    parser.add_argument("--train-last-n-blocks", type=int, default=None)
+    parser.add_argument("--learning-rate", type=float, default=None)
+    parser.add_argument("--gradient-accumulation-steps", type=int, default=None)
+    parser.add_argument("--video-loss-weight", type=float, default=None)
+    parser.add_argument("--action-loss-weight", type=float, default=None)
+    parser.add_argument("--load-worker", type=int, default=None)
+    parser.add_argument("--seed", type=int, default=42)
 
     args = parser.parse_args()
     run(args)

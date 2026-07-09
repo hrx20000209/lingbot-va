@@ -66,20 +66,30 @@ class VA_Server:
         )
         self.streaming_vae = WanVAEStreamingWrapper(self.vae)
 
-        self.tokenizer = load_tokenizer(
-            os.path.join(job_config.wan22_pretrained_model_name_or_path,
-                         'tokenizer'), )
+        self.prompt_emb_path = getattr(job_config, "prompt_emb_path", None)
+        self.negative_prompt_emb_path = getattr(job_config, "negative_prompt_emb_path", None)
+        if self.prompt_emb_path:
+            self.tokenizer = None
+            self.text_encoder = None
+        else:
+            self.tokenizer = load_tokenizer(
+                os.path.join(job_config.wan22_pretrained_model_name_or_path,
+                             'tokenizer'), )
 
-        self.text_encoder = load_text_encoder(
-            os.path.join(job_config.wan22_pretrained_model_name_or_path,
-                         'text_encoder'),
-            torch_dtype=self.dtype,
-            torch_device='cpu' if self.enable_offload else self.device,
-        )
+            self.text_encoder = load_text_encoder(
+                os.path.join(job_config.wan22_pretrained_model_name_or_path,
+                             'text_encoder'),
+                torch_dtype=self.dtype,
+                torch_device='cpu' if self.enable_offload else self.device,
+            )
 
+        transformer_path = getattr(job_config, "transformer_path", None)
+        if not transformer_path:
+            transformer_path = os.path.join(
+                job_config.wan22_pretrained_model_name_or_path, "transformer"
+            )
         self.transformer = load_transformer(
-            os.path.join(job_config.wan22_pretrained_model_name_or_path,
-                         'transformer'),
+            transformer_path,
             torch_dtype=self.dtype,
             torch_device=self.device,
             attn_mode="torch"
@@ -422,6 +432,22 @@ class VA_Server:
         ##### get prompt
         if prompt is None:
             self.prompt_embeds = self.negative_prompt_embeds = None
+        elif self.prompt_emb_path:
+            prompt_embeds = torch.load(
+                self.prompt_emb_path, map_location="cpu", weights_only=False
+            )
+            self.prompt_embeds = prompt_embeds.unsqueeze(0).to(self.device, self.dtype)
+            if self.job_config.guidance_scale > 1:
+                if not self.negative_prompt_emb_path:
+                    raise ValueError("CFG with precomputed text requires negative_prompt_emb_path")
+                negative_embeds = torch.load(
+                    self.negative_prompt_emb_path, map_location="cpu", weights_only=False
+                )
+                self.negative_prompt_embeds = negative_embeds.unsqueeze(0).to(
+                    self.device, self.dtype
+                )
+            else:
+                self.negative_prompt_embeds = None
         else:
             self.prompt_embeds, self.negative_prompt_embeds = self.encode_prompt(
                 prompt=prompt,
@@ -579,7 +605,12 @@ class VA_Server:
                 [self.init_latent, latent_model_input],
                 dim=2) if latent_model_input is not None else self.init_latent
 
-        action_model_input = self.preprocess_action(obs['state'])
+        predicted_action = obs.get('pred_action', obs.get('state'))
+        if predicted_action is None:
+            raise KeyError(
+                "KV-cache updates require pred_action with shape [used_channels, latent_frames, actions_per_frame]"
+            )
+        action_model_input = self.preprocess_action(predicted_action)
         action_model_input = action_model_input.to(latent_model_input)
         logger.info(
             f"get KV cache obs: {latent_model_input.shape} {action_model_input.shape}"
@@ -621,7 +652,7 @@ class VA_Server:
         else:
             logger.info(f"################# Infer One Chunk #################")
             action, _ = self._infer(obs, frame_st_id=self.frame_st_id)
-            return dict(action=action)
+            return dict(action=action, pred_action=action.copy())
     
     def decode_one_video(self, latents, output_type):
         latents = latents.to(self.vae.dtype)
@@ -664,7 +695,8 @@ class VA_Server:
             self.streaming_vae_half.clear_cache()
         del self.transformer
         del self.streaming_vae_half
-        del self.text_encoder
+        if self.text_encoder is not None:
+            del self.text_encoder
         torch.cuda.empty_cache()
         
         # Move VAE to GPU for decoding
@@ -680,6 +712,8 @@ def run(args):
     port = config.port if args.port is None else args.port
     if args.save_root is not None:
         config.save_root = args.save_root
+    if args.transformer_path is not None:
+        config.transformer_path = args.transformer_path
     rank = int(os.getenv("RANK", 0))
     local_rank = int(os.environ.get('LOCAL_RANK', 0))
     world_size = int(os.environ.get("WORLD_SIZE", 1))
@@ -720,6 +754,12 @@ def main():
         type=str,
         default=None,
         help='save root'
+    )
+    parser.add_argument(
+        "--transformer-path",
+        type=str,
+        default=None,
+        help="Optional fine-tuned transformer directory; VAE/T5/tokenizer still come from the base model",
     )
     args = parser.parse_args()
     run(args)

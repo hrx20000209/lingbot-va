@@ -10,6 +10,10 @@ from .va_demo_i2va import va_demo_i2va_cfg
 from .va_libero_cfg import va_libero_cfg
 from .va_libero_train_cfg import va_libero_train_cfg
 from .va_libero_i2va import va_libero_i2va_cfg
+from .va_three_cubes_cfg import va_three_cubes_cfg
+from .va_three_cubes_train_cfg import va_three_cubes_train_cfg
+from .va_so101_front_wrist_cfg import va_so101_front_wrist_cfg
+from .va_so101_front_wrist_train_cfg import va_so101_front_wrist_train_cfg
 
 VA_CONFIGS = {
     'robotwin': va_robotwin_cfg,
@@ -23,4 +27,8 @@ VA_CONFIGS = {
     'libero': va_libero_cfg,
     'libero_train': va_libero_train_cfg,
     'libero_i2av': va_libero_i2va_cfg,
+    'three_cubes': va_three_cubes_cfg,
+    'three_cubes_train': va_three_cubes_train_cfg,
+    'so101_front_wrist': va_so101_front_wrist_cfg,
+    'so101_front_wrist_train': va_so101_front_wrist_train_cfg,
 }
