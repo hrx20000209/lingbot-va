@@ -20,10 +20,28 @@ def _resolve_model_path() -> str:
     return str(candidates[0])
 
 
-# Produced by tools/convert_three_cubes.py + tools/compute_three_cubes_norm_stats.py.
+# norm_stat.json/task_emb.pt/empty_emb.pt are produced on the training machine
+# by tools/convert_three_cubes.py + tools/compute_three_cubes_norm_stats.py,
+# then copied as a group to wherever this config is loaded from (e.g. scp'd to
+# an edge device for on-device inference -- there is no shared filesystem
+# between the two). First existing directory wins; the training-machine path
+# is the fallback so this config still works unchanged there.
+def _resolve_artifacts_dir() -> Path:
+    candidates = [
+        Path("~/Projects/models/lingbot-va-so101-artifacts").expanduser(),
+        Path("/data/rxhuang/three_cubes_1_lingbot"),
+    ]
+    for path in candidates:
+        if path.exists():
+            return path
+    return candidates[0]
+
+
+_ARTIFACTS_DIR = _resolve_artifacts_dir()
+
 # Single source of truth for q01/q99 so training config, deploy config, and the
 # SO101 client all load the same numbers (compared by md5 at deploy time).
-NORM_STAT_PATH = Path("/data/rxhuang/three_cubes_1_lingbot/norm_stat.json")
+NORM_STAT_PATH = _ARTIFACTS_DIR / "norm_stat.json"
 
 
 def _load_norm_stat() -> dict:
@@ -44,8 +62,8 @@ va_so101_cfg.transformer_path = None
 va_so101_cfg.infer_mode = "server"
 # Fixed single-task pick&place: precomputed text embeddings let wan_va_server.py
 # skip loading the tokenizer/text encoder at inference time (see VA_Server.__init__).
-va_so101_cfg.prompt_emb_path = "/data/rxhuang/three_cubes_1_lingbot/task_emb.pt"
-va_so101_cfg.negative_prompt_emb_path = "/data/rxhuang/three_cubes_1_lingbot/empty_emb.pt"
+va_so101_cfg.prompt_emb_path = str(_ARTIFACTS_DIR / "task_emb.pt")
+va_so101_cfg.negative_prompt_emb_path = str(_ARTIFACTS_DIR / "empty_emb.pt")
 
 va_so101_cfg.attn_window = 30
 va_so101_cfg.frame_chunk_size = 4

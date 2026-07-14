@@ -2,25 +2,33 @@
 """Closed-/open-loop SO101 real-robot inference client for the 3-camera
 (front/right/wrist) LingBot-VA post-train.
 
+Edge on-device deployment: this process loads VA_Server directly in-process
+(same GPU, same Python process as the robot control loop) -- there is no
+websocket hop, no separate `launch_server_so101.sh` process, and no second
+machine. `--config-name`/`--checkpoint` build the same VA_Server used by
+`script/launch_server_so101.sh` and `tools/eval_so101_front_wrist_replay_curve.py`;
+see those for the config/checkpoint conventions.
+
 Forked from script/async_so101_client.py, which already implements the
-correct pattern: an async worker thread that (1) updates the server's KV
-cache with the actions just executed plus fresh camera frames, then
-(2) requests the next action chunk, while the main loop keeps executing
-queued actions at --action-hz without blocking on inference. See that file
+correct pattern: an async worker thread that (1) updates the KV cache with
+the actions just executed plus fresh camera frames, then (2) requests the
+next action chunk, while the main loop keeps executing queued actions at
+--action-hz without blocking on inference -- unchanged here, just pointed at
+a local VA_Server instance instead of a WebsocketClientPolicy. See that file
 for the original 2-camera version; this one adds:
 
   - a third camera (right) and CLI-configurable indices/resolution
   - an explicit, asserted downsample-stride derivation instead of a bare
     "every 2nd action" modulo check
-  - client-side clip of the server's already-denormalized action to the
-    dataset's q01/q99 range (norm_stat.json), since wan_va_server.py's
+  - client-side clip of the already-denormalized action to the dataset's
+    q01/q99 range (norm_stat.json), since wan_va_server.py's
     postprocess_action denormalizes but does not clip
   - --dry-run (skip robot.send_action, otherwise run the full perception/
     inference/KV-cache loop) and --open-loop (advance the KV cache with the
     model's own predicted video latent instead of real camera frames --
     never skips the KV-cache update)
-  - norm_stat.json md5 printed at startup for comparison against the
-    server's own printout (see script/launch_server_so101.sh)
+  - norm_stat.json md5 printed at startup so it can be diffed against
+    whatever norm_stat.json a training run used
 
 Key trace notes (see comments inline for where these are used):
   * wan_va_server.py's `_infer` only calls `_encode_obs` (i.e. actually looks
@@ -38,6 +46,7 @@ Key trace notes (see comments inline for where these are used):
 """
 
 import argparse
+import copy
 import hashlib
 import json
 import logging
@@ -53,10 +62,13 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import numpy as np
+import torch
 
 from lerobot.cameras.opencv.configuration_opencv import OpenCVCameraConfig
 from lerobot.robots.so101_follower import SO101Follower, SO101FollowerConfig
-from wan_va.utils.Simple_Remote_Infer.deploy.websocket_client_policy import WebsocketClientPolicy
+from wan_va.configs import VA_CONFIGS
+from wan_va.configs.va_so101_cfg import NORM_STAT_PATH as DEFAULT_NORM_STAT_PATH
+from wan_va.wan_va_server import VA_Server
 
 
 JOINT_NAMES = [
@@ -139,10 +151,16 @@ class InferenceRequest:
 
 
 class InferenceWorker(threading.Thread):
-    def __init__(self, host, port, prompt, initial_observation, request_queue, result_queue, open_loop):
+    """Runs VA_Server.infer() in-process on a background thread so the main
+    loop can keep dequeuing/executing actions at --action-hz without blocking
+    on inference. `server` is a single VA_Server instance built once in
+    main() and touched only from this thread -- the main thread never calls
+    server.infer(), so there is no need for a lock around it.
+    """
+
+    def __init__(self, server, prompt, initial_observation, request_queue, result_queue, open_loop):
         super().__init__(daemon=True)
-        self.host = host
-        self.port = port
+        self.server = server
         self.prompt = prompt
         self.initial_observation = initial_observation
         self.request_queue = request_queue
@@ -151,8 +169,7 @@ class InferenceWorker(threading.Thread):
 
     def run(self):
         try:
-            policy = WebsocketClientPolicy(host=self.host, port=self.port)
-            policy.infer({"reset": True, "prompt": self.prompt})
+            self.server.infer({"reset": True, "prompt": self.prompt})
             while True:
                 request = self.request_queue.get()
                 if request is None:
@@ -166,7 +183,7 @@ class InferenceWorker(threading.Thread):
                         # than skipping the update or requiring fresh camera
                         # frames. See wan_va_server.py _compute_kv_cache's
                         # imagine_latent branch.
-                        kv_ret = policy.infer(
+                        kv_ret = self.server.infer(
                             {
                                 "imagine_latent": request.imagine_latent,
                                 "compute_kv_cache": True,
@@ -174,7 +191,7 @@ class InferenceWorker(threading.Thread):
                             }
                         )
                     else:
-                        kv_ret = policy.infer(
+                        kv_ret = self.server.infer(
                             {
                                 "obs": request.observations,
                                 "compute_kv_cache": True,
@@ -184,8 +201,8 @@ class InferenceWorker(threading.Thread):
                     kv_timing = kv_ret.get("server_timing", {})
                 kv_done = time.monotonic()
                 # obs is vestigial here after the first chunk (see module
-                # docstring), kept only because the server API expects it.
-                result = policy.infer({"obs": [self.initial_observation]})
+                # docstring), kept only because VA_Server.infer expects it.
+                result = self.server.infer({"obs": [self.initial_observation]})
                 self.result_queue.put(
                     {
                         "start_step": request.start_step,
@@ -208,8 +225,14 @@ def parse_args():
         description="SO101 (front/right/wrist) real-robot inference client for LingBot-VA.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--server-host", default="127.0.0.1")
-    parser.add_argument("--server-port", type=int, default=29536)
+    parser.add_argument("--config-name", default="so101")
+    parser.add_argument("--checkpoint", type=Path, default=Path("train_out/so101_three_cubes/checkpoints/last"))
+    parser.add_argument("--guidance-scale", type=float, default=None, help="Override the config's default if set.")
+    parser.add_argument("--action-guidance-scale", type=float, default=None, help="Override the config's default if set.")
+    parser.add_argument("--attn-window", type=int, default=None, help="Override the config's default if set.")
+    parser.add_argument("--enable-offload", action="store_true",
+                         help="Offload VAE/text encoder to CPU to save VRAM (see va_so101_cfg.py).")
+    parser.add_argument("--save-root", type=Path, default=Path("train_out/so101_three_cubes/deploy_debug"))
     parser.add_argument("--robot-port", default="/dev/ttyACM1")
     parser.add_argument("--robot-id", default="follower_arm")
     parser.add_argument("--front-camera", type=int, default=4)
@@ -217,7 +240,7 @@ def parse_args():
     parser.add_argument("--wrist-camera", type=int, default=2)
     parser.add_argument("--camera-width", type=int, default=640)
     parser.add_argument("--camera-height", type=int, default=480)
-    parser.add_argument("--model-width", type=int, default=256, help="Resize to training resolution before sending to the server.")
+    parser.add_argument("--model-width", type=int, default=256, help="Resize to training resolution before running inference.")
     parser.add_argument("--model-height", type=int, default=256)
     parser.add_argument(
         "--task",
@@ -230,7 +253,11 @@ def parse_args():
     parser.add_argument("--max-relative-target", type=float, default=5.0,
                          help="Max per-step joint delta in degrees; enforced by LeRobot's SO101Follower.")
     parser.add_argument("--max-seconds", type=float, default=60.0)
-    parser.add_argument("--norm-stat", type=Path, default=Path("/data/rxhuang/three_cubes_1_lingbot/norm_stat.json"))
+    parser.add_argument(
+        "--norm-stat", type=Path, default=None,
+        help="Defaults to NORM_STAT_PATH resolved by wan_va/configs/va_so101_cfg.py "
+        "(same artifacts-dir candidates the loaded config itself uses).",
+    )
     parser.add_argument("--dry-run", action="store_true",
                          help="Run perception/inference/KV-cache loop but do not send actions to the robot.")
     parser.add_argument("--open-loop", action="store_true",
@@ -239,7 +266,7 @@ def parse_args():
     parser.add_argument(
         "--log-path",
         type=Path,
-        default=Path("/home/rxhuang/Projects/lingbot-va/train_out/so101_three_cubes/deploy_inference.jsonl"),
+        default=Path("train_out/so101_three_cubes/deploy_inference.jsonl"),
     )
     return parser.parse_args()
 
@@ -282,6 +309,29 @@ def write_event(path, event, start_time):
         file.write(json.dumps(event) + "\n")
 
 
+def build_server(args) -> VA_Server:
+    """Load VA_Server in-process on the local GPU. Same config/checkpoint
+    conventions as script/launch_server_so101.sh and
+    tools/eval_so101_front_wrist_replay_curve.py, minus the network layer --
+    there is no separate server process to launch on Thor.
+    """
+    cfg = copy.deepcopy(VA_CONFIGS[args.config_name])
+    checkpoint = args.checkpoint.expanduser().resolve()
+    cfg.transformer_path = str(checkpoint / "transformer" if (checkpoint / "transformer").exists() else checkpoint)
+    if args.guidance_scale is not None:
+        cfg.guidance_scale = args.guidance_scale
+    if args.action_guidance_scale is not None:
+        cfg.action_guidance_scale = args.action_guidance_scale
+    if args.attn_window is not None:
+        cfg.attn_window = args.attn_window
+    if args.enable_offload:
+        cfg.enable_offload = True
+    cfg.save_root = str(args.save_root)
+    cfg.rank = cfg.local_rank = 0
+    cfg.world_size = 1
+    return VA_Server(cfg)
+
+
 def main() -> None:
     args = parse_args()
     if args.replan_remaining_actions % 8:
@@ -290,7 +340,10 @@ def main() -> None:
     assert stride >= 1
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     logging.info(f"downsample stride={stride} (dataset_fps={args.dataset_fps} / target_fps={args.target_fps})")
-    norm_stat = load_norm_stat(args.norm_stat)
+    norm_stat = load_norm_stat(args.norm_stat or DEFAULT_NORM_STAT_PATH)
+
+    logging.info(f"Loading VA_Server in-process: config={args.config_name} checkpoint={args.checkpoint}")
+    server = build_server(args)
 
     robot = make_robot(args)
     robot.connect()
@@ -309,8 +362,7 @@ def main() -> None:
         first_robot_observation = robot.get_observation()
         first_camera_observation = camera_observation(first_robot_observation, args.model_width, args.model_height)
         worker = InferenceWorker(
-            args.server_host,
-            args.server_port,
+            server,
             args.task,
             first_camera_observation,
             request_queue,
@@ -449,4 +501,5 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    torch.set_grad_enabled(False)
     main()

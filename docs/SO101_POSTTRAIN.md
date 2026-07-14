@@ -87,19 +87,38 @@ under `train_out/so101_three_cubes/debug/step_NNNNNN/{train_episode,val_episode}
 + video quality -- not training loss. Expect a useful window around
 300-800 steps per issue #29 (100 episodes here vs. their 83).
 
-## 3. Deploy on the real robot
+## 3. Deploy on the real robot (on-device, single process)
 
-Server (loads the checkpoint + `so101` inference config, asserts
-`attn_mode="torch"` for inference vs. `"flex"` for training):
+`deploy/so101_client.py` loads `VA_Server` **in-process** -- there is no
+websocket hop and no separate server process; the same Python process that
+runs the robot control loop also holds the model on the local GPU. An async
+worker thread calls `VA_Server.infer()` directly (KV-cache update, then next
+action chunk) while the main thread keeps executing queued actions at
+`--action-hz` without blocking on inference. `script/launch_server_so101.sh`
++ a network client is still there as a separate two-machine debug path (e.g.
+testing checkpoints from a workstation without the robot attached), but it is
+not the deployment path below.
+
+**Copy artifacts to the edge device first** (checkpoint + task/negative
+prompt embeddings + norm stats -- none of these are in git; `wan_va/configs/va_so101_cfg.py`
+resolves them from `~/Projects/models/lingbot-va-so101-artifacts/` first,
+falling back to the training machine's own `/data/rxhuang/three_cubes_1_lingbot`
+path):
 
 ```bash
-script/launch_server_so101.sh train_out/so101_three_cubes/checkpoints/last
+# on the training machine
+mkdir -p /tmp/so101_artifacts
+cp /data/rxhuang/three_cubes_1_lingbot/{norm_stat.json,task_emb.pt,empty_emb.pt} /tmp/so101_artifacts/
+rsync -avz /tmp/so101_artifacts/ thor:~/Projects/models/lingbot-va-so101-artifacts/
+rsync -avz train_out/so101_three_cubes/checkpoints/last/ thor:~/Projects/lingbot-va/train_out/so101_three_cubes/checkpoints/last/
 ```
 
-Client (dry run first -- runs the full perception/inference/KV-cache loop
-without sending motor commands):
+Then, on Thor, dry run first (runs the full perception/inference/KV-cache
+loop without sending motor commands):
 
 ```bash
+cd ~/Projects/lingbot-va
+conda activate lingbot
 python deploy/so101_client.py \
   --front-camera 4 --right-camera 6 --wrist-camera 2 \
   --dry-run --max-seconds 120
@@ -118,13 +137,16 @@ instead of real camera frames -- never skips the KV-cache update):
 python deploy/so101_client.py --front-camera 4 --right-camera 6 --wrist-camera 2 --open-loop
 ```
 
-Both the server (`launch_server_so101.sh`) and client
-(`deploy/so101_client.py`) print the md5 of `norm_stat.json` at startup --
-confirm they match before trusting a run. Client-side latency is logged to
+If Thor's GPU memory is tight, add `--enable-offload` to move the VAE/text
+encoder to CPU (see `va_so101_cfg.py`'s `enable_offload`; this is the same
+flag `tools/eval_so101_front_wrist_replay_curve.py --enable_offload` uses).
+
+`deploy/so101_client.py` prints the md5 of `norm_stat.json` at startup --
+compare it against the training machine's own norm_stat.json to confirm the
+copied artifacts actually match this checkpoint. Latency is logged to
 `--log-path` (default `train_out/so101_three_cubes/deploy_inference.jsonl`);
-server-side per-stage timing (`obs_encode_s`/`video_loop_s`/`action_loop_s`/
-`kv_update_s`) rides along in each event's `*_server_timing` field, so both
-logs can be joined on `time_s`/wall-clock timestamps.
+per-stage timing (`obs_encode_s`/`video_loop_s`/`action_loop_s`/
+`kv_update_s`) rides along in each event's `*_server_timing` field.
 
 ## Notes
 
@@ -137,4 +159,14 @@ logs can be joined on `time_s`/wall-clock timestamps.
 - `tools/eval_so101_front_wrist_replay_curve.py` was generalized from a
   hardcoded 2-camera (front/wrist) KV-cache-update loop to loop over
   `cfg.obs_cam_keys` generically; behavior for existing 2-camera configs is
-  unchanged.
+  unchanged. It skips the KV-cache-update call on an episode's final chunk
+  (the truncated tail otherwise gives the streaming VAE too few frames for
+  its causal time-conv, and the update is unused anyway since no further
+  chunk follows) and gained `--enable_offload`.
+- `deploy/so101_client.py` was switched from a `WebsocketClientPolicy` network
+  client to loading `VA_Server` directly in-process (see section 3) for
+  on-device/edge deployment where the model runs on the same machine as the
+  robot control loop. `wan_va/configs/va_so101_cfg.py`'s norm_stat/prompt-embedding
+  paths were made resolvable from multiple candidate directories (was a single
+  hardcoded training-machine path) so the same config works unmodified after
+  copying those artifacts to an edge device.
