@@ -467,10 +467,13 @@ class VA_Server:
         torch.cuda.empty_cache()
 
     def _infer(self, obs, frame_st_id=0):
+        timing = {}
         frame_chunk_size = self.job_config.frame_chunk_size
         if frame_st_id == 0:
+            _t0 = time.monotonic()
             init_latent = self._encode_obs(obs)
             self.init_latent = init_latent
+            timing["obs_encode_s"] = time.monotonic() - _t0
 
         latents = torch.randn(1,
                               48,
@@ -512,6 +515,7 @@ class VA_Server:
                 torch.no_grad(),
         ):
             # 1. Video Generation Loop
+            _t0 = time.monotonic()
             for i, t in enumerate(tqdm(timesteps)):
                 last_step = i == len(timesteps) - 1
                 latent_cond = init_latent[:, :, 0:1].to(
@@ -547,6 +551,8 @@ class VA_Server:
 
                 latents[:, :, 0:1] = latent_cond if frame_st_id == 0 else latents[:, :, 0:1]
 
+            timing["video_loop_s"] = time.monotonic() - _t0
+            _t0 = time.monotonic()
             for i, t in enumerate(tqdm(action_timesteps)):
                 last_step = i == len(action_timesteps) - 1
                 action_cond = torch.zeros(
@@ -586,6 +592,8 @@ class VA_Server:
 
                 actions[:, :, 0:1] = action_cond if frame_st_id == 0 else actions[:, :, 0:1]
 
+            timing["action_loop_s"] = time.monotonic() - _t0
+
         actions[:, ~self.action_mask] *= 0
 
         save_async(latents, os.path.join(self.exp_save_root, f'latents_{frame_st_id}.pt'))
@@ -593,13 +601,26 @@ class VA_Server:
 
         actions = self.postprocess_action(actions)
         torch.cuda.empty_cache()
-        return actions, latents
+        return actions, latents, timing
 
     def _compute_kv_cache(self, obs):
+        timing = {}
         ### optional async save obs for debug
         self.transformer.clear_pred_cache(self.cache_name)
-        save_async(obs['obs'], os.path.join(self.exp_save_root, f'obs_data_{self.frame_st_id}.pt'))
-        latent_model_input = self._encode_obs(obs)
+        # Open-loop clients pass back the video latent this server already
+        # predicted (returned as `pred_latent` from a prior infer() call)
+        # instead of real camera frames, so the KV cache advances on the
+        # model's own imagined rollout rather than skipping the update.
+        _t0 = time.monotonic()
+        imagine_latent = obs.get('imagine_latent')
+        if imagine_latent is not None:
+            latent_model_input = (
+                torch.from_numpy(imagine_latent) if isinstance(imagine_latent, np.ndarray) else imagine_latent
+            ).to(device=self.device, dtype=self.dtype)
+        else:
+            save_async(obs['obs'], os.path.join(self.exp_save_root, f'obs_data_{self.frame_st_id}.pt'))
+            latent_model_input = self._encode_obs(obs)
+        timing["obs_encode_s"] = time.monotonic() - _t0
         if self.frame_st_id == 0:
             latent_model_input = torch.cat(
                 [self.init_latent, latent_model_input],
@@ -619,6 +640,7 @@ class VA_Server:
                                                 action_model_input,
                                                 frame_st_id=self.frame_st_id)
 
+        _t0 = time.monotonic()
         with (
                 torch.no_grad(),
         ):
@@ -631,8 +653,10 @@ class VA_Server:
                              update_cache=2,
                              cache_name=self.cache_name,
                              action_mode=True)
+        timing["kv_update_s"] = time.monotonic() - _t0
         torch.cuda.empty_cache()
         self.frame_st_id += latent_model_input.shape[2]
+        return timing
 
     @torch.no_grad()
     def infer(self, obs):
@@ -647,12 +671,21 @@ class VA_Server:
         elif compute_kv_cache:
             logger.info(
                 f"################# Compute KV Cache #################")
-            self._compute_kv_cache(obs)
-            return dict()
+            kv_timing = self._compute_kv_cache(obs)
+            return dict(server_timing=kv_timing)
         else:
             logger.info(f"################# Infer One Chunk #################")
-            action, _ = self._infer(obs, frame_st_id=self.frame_st_id)
-            return dict(action=action, pred_action=action.copy())
+            action, latents, timing = self._infer(obs, frame_st_id=self.frame_st_id)
+            # pred_latent lets an --open-loop client advance the KV cache with
+            # this server's own predicted video (see _compute_kv_cache's
+            # imagine_latent branch) instead of skipping the update or
+            # requiring a new real observation.
+            return dict(
+                action=action,
+                pred_action=action.copy(),
+                pred_latent=latents.detach().float().cpu().numpy(),
+                server_timing=timing,
+            )
     
     def decode_one_video(self, latents, output_type):
         latents = latents.to(self.vae.dtype)
@@ -683,7 +716,7 @@ class VA_Server:
         pred_latent_lst = []
         pred_action_lst = []
         for chunk_id in range(self.job_config.num_chunks_to_infer):
-            actions, latents = self._infer(init_obs, frame_st_id=(chunk_id * self.job_config.frame_chunk_size))
+            actions, latents, _ = self._infer(init_obs, frame_st_id=(chunk_id * self.job_config.frame_chunk_size))
             actions = torch.from_numpy(actions)
             pred_latent_lst.append(latents)
             pred_action_lst.append(actions)

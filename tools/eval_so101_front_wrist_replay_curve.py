@@ -131,6 +131,7 @@ def main() -> None:
     parser.add_argument("--action_guidance_scale", type=float, default=1.0)
     parser.add_argument("--attn_window", type=int, default=30)
     parser.add_argument("--reset_each_chunk", action="store_true")
+    parser.add_argument("--enable_offload", action="store_true", help="Offload VAE/text encoder to CPU to save VRAM on shared GPUs.")
     args = parser.parse_args()
 
     cfg = copy.deepcopy(VA_CONFIGS[args.config_name])
@@ -139,6 +140,8 @@ def main() -> None:
     cfg.guidance_scale = args.guidance_scale
     cfg.action_guidance_scale = args.action_guidance_scale
     cfg.attn_window = args.attn_window
+    if args.enable_offload:
+        cfg.enable_offload = True
     cfg.save_root = str(args.output_dir / "server_debug")
     cfg.rank = cfg.local_rank = 0
     cfg.world_size = 1
@@ -176,21 +179,11 @@ def main() -> None:
         obs_history = []
         for offset in range(len(executable)):
             frame_idx = min(action_cursor + offset, len(gt) - 1)
-            obs_history.append(
-                {
-                    "front": cameras[cfg.obs_cam_keys[0]][frame_idx],
-                    "wrist": cameras[cfg.obs_cam_keys[1]][frame_idx],
-                }
-            )
-        if not args.reset_each_chunk:
+            obs_history.append(make_obs(cameras, cfg.obs_cam_keys, frame_idx))
+        is_last_chunk = (action_cursor + len(executable) >= len(gt)) or (chunk_idx + 1 >= args.max_chunks)
+        if not args.reset_each_chunk and not is_last_chunk:
             kv_obs = {
-                "obs": [
-                    {
-                        cfg.obs_cam_keys[0]: ob["front"],
-                        cfg.obs_cam_keys[1]: ob["wrist"],
-                    }
-                    for ob in obs_history[::-2][::-1]
-                ],
+                "obs": [ob for ob in obs_history[::-2][::-1]],
                 "prompt": [task],
                 "compute_kv_cache": True,
                 "imagine": False,

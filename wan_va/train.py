@@ -87,9 +87,15 @@ class Trainer:
         else:
             transformer_path = os.path.join(config.wan22_pretrained_model_name_or_path, 'transformer')
 
+        # Optional override (default: unchanged fp32 master-weight behavior for
+        # every other config). Only set by configs that need to fit full-model
+        # forward-pass memory (frozen + trainable params) on fewer/smaller
+        # GPUs, e.g. va_so101_train_cfg.py for a single-GPU attempt -- trades
+        # AdamW's fp32-master-weight precision for roughly half the resident
+        # parameter memory.
         self.transformer = load_transformer(
             transformer_path,
-            torch_dtype=torch.float32,
+            torch_dtype=getattr(config, "transformer_load_dtype", torch.float32),
             torch_device='cpu',
             attn_mode="flex"
         )
@@ -692,6 +698,8 @@ def run(args):
         value = getattr(args, name)
         if value is not None:
             config[name] = value
+    if args.transformer_load_dtype is not None:
+        config.transformer_load_dtype = getattr(torch, args.transformer_load_dtype)
 
     if rank == 0:
         logger.info(f"Using config: {args.config_name}")
@@ -732,6 +740,14 @@ def main():
     parser.add_argument("--video-loss-weight", type=float, default=None)
     parser.add_argument("--action-loss-weight", type=float, default=None)
     parser.add_argument("--load-worker", type=int, default=None)
+    parser.add_argument(
+        "--transformer-load-dtype",
+        choices=["float32", "bfloat16"],
+        default=None,
+        help="Override the transformer's resident weight dtype (default: config's own value, "
+        "or float32 if unset). bfloat16 roughly halves resident parameter memory at the cost "
+        "of AdamW updating bf16 master weights instead of fp32 for whatever stays trainable.",
+    )
     parser.add_argument("--seed", type=int, default=42)
 
     args = parser.parse_args()

@@ -1,1 +1,25 @@
+# Python
+__pycache__/
 *.pyc
+*.pyo
+*.egg-info/
+.eggs/
+build/
+dist/
+.mypy_cache/
+.pytest_cache/
+
+# Training / eval outputs (checkpoints, logs, plots, server debug dumps) -- large, regenerate locally
+train_out/
+*.safetensors
+*.pt
+*.pth
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+
+# Env
+.venv/
+venv/

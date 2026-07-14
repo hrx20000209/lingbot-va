@@ -14,6 +14,8 @@ from .va_three_cubes_cfg import va_three_cubes_cfg
 from .va_three_cubes_train_cfg import va_three_cubes_train_cfg
 from .va_so101_front_wrist_cfg import va_so101_front_wrist_cfg
 from .va_so101_front_wrist_train_cfg import va_so101_front_wrist_train_cfg
+from .va_so101_cfg import va_so101_cfg
+from .va_so101_train_cfg import va_so101_train_cfg
 
 VA_CONFIGS = {
     'robotwin': va_robotwin_cfg,
@@ -31,4 +33,6 @@ VA_CONFIGS = {
     'three_cubes_train': va_three_cubes_train_cfg,
     'so101_front_wrist': va_so101_front_wrist_cfg,
     'so101_front_wrist_train': va_so101_front_wrist_train_cfg,
+    'so101': va_so101_cfg,
+    'so101_train': va_so101_train_cfg,
 }
