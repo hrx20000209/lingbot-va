@@ -65,7 +65,7 @@ import numpy as np
 import torch
 
 from lerobot.cameras.opencv.configuration_opencv import OpenCVCameraConfig
-from lerobot.robots.so101_follower import SO101Follower, SO101FollowerConfig
+from lerobot.robots.so_follower import SO101Follower, SO101FollowerConfig
 from wan_va.configs import VA_CONFIGS
 from wan_va.configs.va_so101_cfg import NORM_STAT_PATH as DEFAULT_NORM_STAT_PATH
 from wan_va.wan_va_server import VA_Server
@@ -220,6 +220,17 @@ class InferenceWorker(threading.Thread):
             self.result_queue.put({"error": repr(exc)})
 
 
+def camera_arg(value: str):
+    """A camera identifier: either an integer V4L2 index (e.g. "2") or a device
+    path. Prefer a stable path (e.g. a /dev/v4l/by-path/... symlink) because bare
+    integer indices are not stable across re-enumeration -- the same physical
+    camera can move indices when USB nodes are re-scanned, which would silently
+    feed the policy the wrong view. OpenCVCameraConfig accepts int | Path.
+    """
+    value = str(value)
+    return int(value) if value.isdigit() else Path(value)
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description="SO101 (front/right/wrist) real-robot inference client for LingBot-VA.",
@@ -235,11 +246,21 @@ def parse_args():
     parser.add_argument("--save-root", type=Path, default=Path("train_out/so101_three_cubes/deploy_debug"))
     parser.add_argument("--robot-port", default="/dev/ttyACM1")
     parser.add_argument("--robot-id", default="follower_arm")
-    parser.add_argument("--front-camera", type=int, default=4)
-    parser.add_argument("--right-camera", type=int, default=6)
-    parser.add_argument("--wrist-camera", type=int, default=2)
+    parser.add_argument("--front-camera", type=camera_arg, default=4,
+                        help="V4L2 index or device path; prefer a stable /dev/v4l/by-path/... symlink.")
+    parser.add_argument("--right-camera", type=camera_arg, default=6,
+                        help="V4L2 index or device path; prefer a stable /dev/v4l/by-path/... symlink.")
+    parser.add_argument("--wrist-camera", type=camera_arg, default=2,
+                        help="V4L2 index or device path; prefer a stable /dev/v4l/by-path/... symlink.")
     parser.add_argument("--camera-width", type=int, default=640)
     parser.add_argument("--camera-height", type=int, default=480)
+    parser.add_argument("--camera-fps", type=int, default=30,
+                        help="Capture fps for the V4L2 async read threads. Lower (e.g. 15) reduces "
+                             "USB bandwidth and per-camera thread wakeups when several cameras share a controller.")
+    parser.add_argument("--camera-fourcc", default="MJPG",
+                        help="Pixel format FOURCC for capture. Default MJPG (compressed) so all "
+                             "three cameras fit within USB bandwidth; uncompressed YUYV starves "
+                             "the third camera on a shared controller. Pass '' to leave unset.")
     parser.add_argument("--model-width", type=int, default=256, help="Resize to training resolution before running inference.")
     parser.add_argument("--model-height", type=int, default=256)
     parser.add_argument(
@@ -272,10 +293,11 @@ def parse_args():
 
 
 def make_robot(args):
+    fourcc = args.camera_fourcc or None
     cameras = {
-        "front": OpenCVCameraConfig(index_or_path=args.front_camera, fps=30, width=args.camera_width, height=args.camera_height),
-        "right": OpenCVCameraConfig(index_or_path=args.right_camera, fps=30, width=args.camera_width, height=args.camera_height),
-        "wrist": OpenCVCameraConfig(index_or_path=args.wrist_camera, fps=30, width=args.camera_width, height=args.camera_height),
+        "front": OpenCVCameraConfig(index_or_path=args.front_camera, fps=args.camera_fps, width=args.camera_width, height=args.camera_height, fourcc=fourcc),
+        "right": OpenCVCameraConfig(index_or_path=args.right_camera, fps=args.camera_fps, width=args.camera_width, height=args.camera_height, fourcc=fourcc),
+        "wrist": OpenCVCameraConfig(index_or_path=args.wrist_camera, fps=args.camera_fps, width=args.camera_width, height=args.camera_height, fourcc=fourcc),
     }
     config = SO101FollowerConfig(
         port=args.robot_port,
